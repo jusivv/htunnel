@@ -21,23 +21,34 @@ package com.dutertry.htunnel.server.controller;
 
 import static com.dutertry.htunnel.common.Constants.HEADER_CONNECTION_ID;
 
+import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.SocketChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.security.MessageDigest;
 import java.security.PublicKey;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.Base64;
+import java.util.HashMap;
+import java.util.Map;
 
 import javax.annotation.PostConstruct;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
+import com.dutertry.htunnel.common.Constants;
 import org.apache.commons.lang3.StringUtils;
+import org.bouncycastle.crypto.digests.MD5Digest;
+import org.bouncycastle.jcajce.provider.digest.MD5;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -72,30 +83,81 @@ public class TunnelController {
     
     @Value("${public-key:}")
     private String publicKeyPath;
+
+    @Value("${load-public-key-interval:0}")
+    private long loadPublicKeyIntervalInMinutes;
     
-    private PublicKey publicKey;
-    
+    private Map<String, PublicKey> publicKeyMap;
+
+    private long lastTimeLoadPublicKey;
+
+    public TunnelController() {
+        publicKeyMap = new HashMap<>();
+    }
+
+    private synchronized void loadPublicKeys() throws IOException {
+        lastTimeLoadPublicKey = System.currentTimeMillis();
+        if(StringUtils.isNotBlank(publicKeyPath)) {
+            Path path = Paths.get(publicKeyPath);
+            if (Files.exists(path)) {
+                publicKeyMap.clear();
+                if (Files.isDirectory(path)) {
+                    LOGGER.info("Using public key in directory {} for connection certification", publicKeyPath);
+                    Files.list(path).filter(p -> p.toString().toLowerCase().endsWith(".pem")).forEach(p -> {
+                        try {
+                            String keyPath = p.toString();
+                            publicKeyMap.put(CryptoUtils.md5Digest(p), CryptoUtils.readRSAPublicKey(keyPath));
+                            LOGGER.info("Load public key {}", keyPath);
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+                } else {
+                    publicKeyMap.put(CryptoUtils.md5Digest(path), CryptoUtils.readRSAPublicKey(publicKeyPath));
+                    LOGGER.info("Using public key {} for connection certification", publicKeyPath);
+                }
+            }
+        }
+    }
+
     @PostConstruct
     public void init() throws IOException {
-        if(StringUtils.isNotBlank(publicKeyPath)) {
-            LOGGER.info("Using public key {} for connection certification", publicKeyPath);
-            publicKey = CryptoUtils.readRSAPublicKey(publicKeyPath);
-        }
+        loadPublicKeys();
     }
     
     @RequestMapping(value = "/hello", method = RequestMethod.GET)
     public String hello(HttpServletRequest request) {
         String ipAddress = request.getRemoteAddr();
-        return ipAddress + "/" + LocalDateTime.now().toString();
+        if(publicKeyMap.size() > 0) {
+            String clientId = request.getHeader(Constants.HEADER_CLIENT_ID);
+            if (StringUtils.isNotBlank(clientId) && !publicKeyMap.containsKey(clientId)
+                && loadPublicKeyIntervalInMinutes > 0
+                && System.currentTimeMillis() - lastTimeLoadPublicKey > loadPublicKeyIntervalInMinutes * 60000) {
+                try {
+                    loadPublicKeys();
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        }
+        return ipAddress + "/" + LocalDateTime.now().toString() + "/"
+                + (loadPublicKeyIntervalInMinutes == 0 ? 0 : lastTimeLoadPublicKey);
     }
     
-    @RequestMapping(value = "/connect", method = RequestMethod.POST)
+    @RequestMapping(value = "/begin", method = RequestMethod.POST)
     public String connection(
             HttpServletRequest request,
             @RequestBody byte[] connectionRequestBytes) throws IOException {
         
         byte[] decrypted = connectionRequestBytes;
-        if(publicKey != null) {
+        if(publicKeyMap.size() > 0) {
+            String clientId = request.getHeader(Constants.HEADER_CLIENT_ID);
+            PublicKey publicKey;
+            if (StringUtils.isNotBlank(clientId) && publicKeyMap.containsKey(clientId)) {
+                publicKey = publicKeyMap.get(clientId);
+            } else {
+                publicKey = publicKeyMap.get(0);
+            }
             try {
                 decrypted = CryptoUtils.decryptRSA(connectionRequestBytes, publicKey);
             } catch(Exception e) {
@@ -135,7 +197,7 @@ public class TunnelController {
         return clientConnectionManager.createConnection(ipAddress, connectionConfig, socketChannel);
     }
 
-    @RequestMapping(value = "/write", method = RequestMethod.POST)
+    @RequestMapping(value = "/upload", method = RequestMethod.POST)
     public void write(
             HttpServletRequest request,
             @RequestHeader(HEADER_CONNECTION_ID) String connectionId,
@@ -161,7 +223,7 @@ public class TunnelController {
         }
     }
     
-    @RequestMapping(value = "/read", method = RequestMethod.GET)
+    @RequestMapping(value = "/download", method = RequestMethod.GET)
     public byte[] read(
             HttpServletRequest request,
             @RequestHeader(HEADER_CONNECTION_ID) String connectionId) throws IOException {
@@ -212,7 +274,7 @@ public class TunnelController {
         }
     }
     
-    @RequestMapping(value = "/close", method = RequestMethod.GET)
+    @RequestMapping(value = "/finish", method = RequestMethod.GET)
     public void close(
             HttpServletRequest request,
             @RequestHeader(HEADER_CONNECTION_ID) String connectionId) throws IOException {

@@ -21,7 +21,10 @@ package com.dutertry.htunnel.common.crypto;
 
 import java.io.FileReader;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
@@ -36,6 +39,8 @@ import javax.crypto.spec.SecretKeySpec;
 
 import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
+import org.bouncycastle.jcajce.provider.digest.MD5;
+import org.bouncycastle.openssl.PEMKeyPair;
 import org.bouncycastle.openssl.PEMParser;
 import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter;
 
@@ -82,15 +87,19 @@ public class CryptoUtils {
         
         Cipher cipher = Cipher.getInstance(AES_ENCRYPT_ALGO);
         cipher.init(Cipher.DECRYPT_MODE, secret, new IvParameterSpec(iv));
-        byte[] plainText = cipher.doFinal(cipherText);
-        return plainText;
+        return cipher.doFinal(cipherText);
     }
     
     public static PrivateKey readRSAPrivateKey(String keyPath) throws IOException {
         PrivateKeyInfo privateKeyInfo;
         try(FileReader reader = new FileReader(keyPath);
                 PEMParser pemParser = new PEMParser(reader)) {
-            privateKeyInfo = PrivateKeyInfo.getInstance(pemParser.readObject());
+            Object obj = pemParser.readObject();
+            if (obj instanceof PEMKeyPair) {
+                privateKeyInfo = ((PEMKeyPair) obj).getPrivateKeyInfo();
+            } else {
+                privateKeyInfo = PrivateKeyInfo.getInstance(pemParser.readObject());
+            }
         }
         JcaPEMKeyConverter converter = new JcaPEMKeyConverter();
         return converter.getPrivateKey(privateKeyInfo);
@@ -118,5 +127,17 @@ public class CryptoUtils {
         cipher.init(Cipher.ENCRYPT_MODE, privateKey);
         byte[] crypted = cipher.doFinal(decrypted);
         return Base64.getEncoder().encode(crypted);
+    }
+
+    public static String md5Digest(Path file) throws IOException {
+        MD5.Digest digest = new MD5.Digest();
+        byte[] buff = new byte[8192];
+        int len;
+        try (InputStream inputStream = Files.newInputStream(file)) {
+            while ((len = inputStream.read(buff)) != -1) {
+                digest.update(buff, 0, len);
+            }
+            return Base64.getEncoder().encodeToString(digest.digest());
+        }
     }
 }

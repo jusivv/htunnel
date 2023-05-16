@@ -27,9 +27,14 @@ import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
-import java.security.PrivateKey;
+import java.security.*;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
 
+import com.dutertry.htunnel.common.Constants;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.http.HttpHost;
 import org.apache.http.HttpStatus;
@@ -40,6 +45,9 @@ import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.utils.URIBuilder;
+import org.apache.http.conn.ssl.NoopHostnameVerifier;
+import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
+import org.apache.http.conn.ssl.TrustAllStrategy;
 import org.apache.http.entity.ByteArrayEntity;
 import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.client.BasicCredentialsProvider;
@@ -47,6 +55,7 @@ import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.impl.conn.DefaultProxyRoutePlanner;
+import org.apache.http.ssl.SSLContextBuilder;
 import org.apache.http.util.EntityUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -55,6 +64,9 @@ import com.dutertry.htunnel.common.ConnectionConfig;
 import com.dutertry.htunnel.common.ConnectionRequest;
 import com.dutertry.htunnel.common.crypto.CryptoUtils;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import sun.security.ssl.SSLSocketFactoryImpl;
+
+import javax.net.ssl.*;
 
 /**
  * @author Nicolas Dutertry
@@ -71,10 +83,13 @@ public class TunnelClient implements Runnable {
     private final int bufferSize;
     private final boolean base64Encoding;
     private final PrivateKey privateKey;
+
+    private final String publicKeyDigest;
     
     private String connectionId;
     
-    public TunnelClient(SocketChannel socketChannel, String host, int port, String tunnel, String proxy, int bufferSize, boolean base64Encoding, PrivateKey privateKey) {
+    public TunnelClient(SocketChannel socketChannel, String host, int port, String tunnel, String proxy, int bufferSize,
+                        boolean base64Encoding, PrivateKey privateKey, String publicKeyDigest) {
         this.socketChannel = socketChannel;
         this.host = host;
         this.port = port;
@@ -83,9 +98,11 @@ public class TunnelClient implements Runnable {
         this.bufferSize = bufferSize;
         this.base64Encoding = base64Encoding;
         this.privateKey = privateKey;
+        this.publicKeyDigest = publicKeyDigest;
     }
     
-    public CloseableHttpClient createHttpCLient() throws URISyntaxException {
+    public CloseableHttpClient createHttpCLient() throws URISyntaxException, NoSuchAlgorithmException,
+            KeyStoreException, KeyManagementException {
         HttpClientBuilder builder = HttpClients.custom();
         if(StringUtils.isNotBlank(proxy)) {
             URI proxyUri = new URI(proxy);
@@ -106,6 +123,12 @@ public class TunnelClient implements Runnable {
                 builder.setDefaultCredentialsProvider(credentialsProvider);
             }
         }
+        SSLContext sslContext =
+                SSLContextBuilder.create().loadTrustMaterial(new TrustAllStrategy()).build();
+        HostnameVerifier allowAllHosts = new NoopHostnameVerifier();
+        SSLConnectionSocketFactory connectionFactory = new SSLConnectionSocketFactory(
+                sslContext, allowAllHosts);
+        builder.setSSLSocketFactory(connectionFactory);
         return  builder.build();
     }
 
@@ -114,9 +137,17 @@ public class TunnelClient implements Runnable {
         LOGGER.info("Connecting to tunnel {}", tunnel);
         try(CloseableHttpClient httpclient = createHttpCLient()) {
             // Hello
-            URI helloUri = new URIBuilder(tunnel)
-                    .setPath("/hello")
+            URIBuilder helloBuilder = new URIBuilder(tunnel);
+            List<String> pathList = new ArrayList<>(helloBuilder.getPathSegments());
+            pathList.add("hello");
+            URI helloUri = helloBuilder
+                    .setPathSegments(pathList)
                     .build();
+            LOGGER.info("url: {}", helloUri.toString());
+            HttpGet httpGet = new HttpGet(helloUri);
+            if (StringUtils.isNotBlank(publicKeyDigest)) {
+                httpGet.addHeader(Constants.HEADER_CLIENT_ID, publicKeyDigest);
+            }
             String helloResult;
             try(CloseableHttpResponse response = httpclient.execute(new HttpGet(helloUri))) {
                 if(response.getStatusLine().getStatusCode() != HttpStatus.SC_OK) {
@@ -125,10 +156,24 @@ public class TunnelClient implements Runnable {
                 }
                 helloResult = EntityUtils.toString(response.getEntity());
             }
+            String strLastTimeLoadPublicKey = StringUtils.substringAfterLast(helloResult, "/");
+            long lastTimeLoadPublicKey = 0;
+            try {
+                lastTimeLoadPublicKey = Long.parseLong(strLastTimeLoadPublicKey);
+                helloResult = StringUtils.substringBeforeLast(helloResult, "/");
+            } catch (NumberFormatException e) {
+
+            }
+            if (lastTimeLoadPublicKey > 0) {
+                LOGGER.info("The server reload public key at {}ms ago", System.currentTimeMillis() - lastTimeLoadPublicKey);
+            }
             
             // Connect
-            URI connectUri = new URIBuilder(tunnel)
-                    .setPath("/connect")
+            URIBuilder connectBuilder = new URIBuilder(tunnel);
+            pathList = new ArrayList<>(connectBuilder.getPathSegments());
+            pathList.add("begin");
+            URI connectUri = connectBuilder
+                    .setPathSegments(pathList)
                     .build();
             
             ConnectionConfig connectionConfig = new ConnectionConfig();
@@ -149,6 +194,9 @@ public class TunnelClient implements Runnable {
             }
             
             HttpPost httppost = new HttpPost(connectUri);
+            if (StringUtils.isNotBlank(publicKeyDigest)) {
+                httppost.addHeader(Constants.HEADER_CLIENT_ID, publicKeyDigest);
+            }
             httppost.setEntity(new ByteArrayEntity(sendBytes));
             
             try(CloseableHttpResponse response = httpclient.execute(httppost)) {
@@ -172,7 +220,7 @@ public class TunnelClient implements Runnable {
             }
         }
             
-        Thread writeThread = new Thread(() -> this.writeLoop());
+        Thread writeThread = new Thread(this::writeLoop);
         writeThread.setDaemon(true);
         writeThread.start();
         
@@ -181,8 +229,11 @@ public class TunnelClient implements Runnable {
     
     private void readLoop() {
         try(CloseableHttpClient httpclient = createHttpCLient()) {
-            URI readUri = new URIBuilder(tunnel)
-                    .setPath("/read")
+            URIBuilder readBuilder = new URIBuilder(tunnel);
+            List<String> pathList = new ArrayList<>(readBuilder.getPathSegments());
+            pathList.add("download");
+            URI readUri = readBuilder
+                    .setPathSegments(pathList)
                     .build();
             while(!Thread.currentThread().isInterrupted()) {
                 HttpGet httpget = new HttpGet(readUri);
@@ -235,8 +286,11 @@ public class TunnelClient implements Runnable {
                 
                 if(!bb.hasRemaining() || read <= 0) {
                     if(bb.position() > 0) {
-                        URI writeUri = new URIBuilder(tunnel)
-                                .setPath("/write")
+                        URIBuilder writeBuilder = new URIBuilder(tunnel);
+                        List<String> pathList = new ArrayList<>(writeBuilder.getPathSegments());
+                        pathList.add("upload");
+                        URI writeUri = writeBuilder
+                                .setPathSegments(pathList)
                                 .build();
                         
                         HttpPost httppost = new HttpPost(writeUri);
@@ -278,7 +332,7 @@ public class TunnelClient implements Runnable {
         
         try(CloseableHttpClient httpclient = createHttpCLient()) {
             URI closeUri = new URIBuilder(tunnel)
-                    .setPath("/close")
+                    .setPath("/finish")
                     .build();
             
             HttpGet httpget = new HttpGet(closeUri);
